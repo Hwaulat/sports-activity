@@ -1,227 +1,679 @@
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import {
-  ArrowDownLeft,
-  ArrowLeft,
-  ArrowLeftRight,
-  ArrowUpRight,
   BatteryFull,
-  Bell,
-  Check,
-  ChevronRight,
-  CircleHelp,
-  Coffee,
-  CreditCard,
-  Eye,
-  EyeOff,
-  Gift,
-  Home,
-  Landmark,
-  LockKeyhole,
-  Mail,
-  MapPin,
-  Phone,
-  Plus,
-  Receipt,
-  Search,
-  Settings,
-  ShieldCheck,
-  ShoppingBag,
+  CalendarDays,
+  Compass,
+  Flame,
+  LineChart,
   Signal,
-  SlidersHorizontal,
-  Smartphone,
   UserRound,
-  Wallet,
   Wifi,
-  type LucideIcon,
 } from "lucide-react";
+import { toast } from "sonner";
 
+import { CloudSyncModal } from "@/components/sports/CloudSyncModal";
+import { GymLoggerModal } from "@/components/sports/GymLoggerModal";
+import { OnboardingWizard } from "@/components/sports/OnboardingWizard";
+import { PlanScreen } from "@/components/sports/PlanScreen";
+import { ProfileSettingsScreen } from "@/components/sports/ProfileSettingsScreen";
+import { ProgressScreen } from "@/components/sports/ProgressScreen";
+import { ReviewerConsoleScreen } from "@/components/sports/ReviewerConsoleScreen";
+import { RunTrackerScreen } from "@/components/sports/RunTrackerScreen";
+import { TodayScreen } from "@/components/sports/TodayScreen";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
+import { Toaster } from "@/components/ui/sonner";
+import { calculateCalorieGuidance, evaluateWeeklyAdaptation } from "@/lib/fitness-engine";
+import { COPY } from "@/lib/i18n";
+import { buildWeeklyPlan, moveSessionToDay } from "@/lib/plan-builder";
+import { clearAppState, createInitialAppState, loadAppState, saveAppState } from "@/lib/storage";
+import {
+  type CloudSyncStatus,
+  deleteUserCloudData,
+  ensureSupabaseSession,
+  fetchApprovedKnowledgeBase,
+  pullUserTransactions,
+  syncAllTransactions,
+  syncGymLog,
+  syncProfileAndGoal,
+  syncReport,
+  syncRunLog,
+  syncWeeklyCheckIn,
+  syncWeeklyPlan,
+  syncWeightEntry,
+} from "@/lib/supabase-sync";
+import type {
+  AppState,
+  DayOfWeek,
+  GymLog,
+  PlannedSession,
+  RecommendationRecord,
+  RunLog,
+} from "@/types/fitness";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Neobank — Keuangan pribadi dalam satu genggaman" },
+      { title: "Stride & Iron — Weekly Training & Calorie Planner" },
       {
         name: "description",
-        content: "Pantau saldo, kartu, transaksi, dan aktivitas keuangan harian Anda.",
+        content:
+          "Evidence-based weekly gym and running plans, Mifflin-St Jeor calorie guidance, local session reminders, and GPS run tracking.",
       },
-      { property: "og:title", content: "Neobank — Keuangan pribadi dalam satu genggaman" },
+      {
+        property: "og:title",
+        content: "Stride & Iron — Weekly Training & Calorie Planner",
+      },
       {
         property: "og:description",
-        content: "Pantau saldo, kartu, transaksi, dan aktivitas keuangan harian Anda.",
+        content:
+          "Personalized weekly plans backed by reviewed expert sources, deterministic safety rules, GPS run tracking, and gym logging.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
     ],
   }),
-  component: Index,
+  component: SportsActivityApp,
 });
 
-type TabKey = "home" | "map" | "transfer" | "settings" | "profile";
-type Screen = TabKey | "transactions" | "add-money";
-type Transaction = {
-  merchant: string;
-  detail: string;
-  amount: number;
-  kind: "expense" | "income";
-  icon: LucideIcon;
-};
+type TabKey = "today" | "plan" | "run" | "progress" | "profile";
+type SubScreen = TabKey | "onboarding" | "edit-profile" | "reviewer";
 
-const navigation: { id: TabKey; label: string; icon: LucideIcon }[] = [
-  { id: "home", label: "Beranda", icon: Home },
-  { id: "map", label: "Peta", icon: MapPin },
-  { id: "transfer", label: "Transfer", icon: ArrowLeftRight },
-  { id: "settings", label: "Pengaturan", icon: Settings },
-  { id: "profile", label: "Profil", icon: UserRound },
-];
+export function SportsActivityApp() {
+  const [state, setState] = useState<AppState>(() => createInitialAppState(true));
+  const [hydrated, setHydrated] = useState(false);
+  const [screen, setScreen] = useState<SubScreen>("today");
+  const [osReduceMotion, setOsReduceMotion] = useState(false);
+  const [osDarkTheme, setOsDarkTheme] = useState(false);
+  const [activeRunSession, setActiveRunSession] = useState<PlannedSession | undefined>(undefined);
+  const [gymModalSession, setGymModalSession] = useState<PlannedSession | undefined>(undefined);
+  const [gymModalOpen, setGymModalOpen] = useState(false);
+  const [cloudModalOpen, setCloudModalOpen] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<CloudSyncStatus>({ state: "checking" });
 
-const transactions: Transaction[] = [
-  {
-    merchant: "Kopi Kenangan",
-    detail: "Hari ini, 09.00",
-    amount: 28500,
-    kind: "expense",
-    icon: Coffee,
-  },
-  {
-    merchant: "Super Indo",
-    detail: "Hari ini, 08.12",
-    amount: 186400,
-    kind: "expense",
-    icon: ShoppingBag,
-  },
-  {
-    merchant: "Cashback belanja",
-    detail: "Kemarin, 18.42",
-    amount: 12500,
-    kind: "income",
-    icon: Gift,
-  },
-  {
-    merchant: "Grab",
-    detail: "Kemarin, 17.30",
-    amount: 42000,
-    kind: "expense",
-    icon: ArrowDownLeft,
-  },
-];
+  const initializeCloudSync = useCallback(async (localSnapshot: AppState) => {
+    if (import.meta.env.MODE === "test") {
+      setCloudStatus({ state: "offline", message: "Test environment" });
+      return;
+    }
+    setCloudStatus({ state: "checking" });
+    const session = await ensureSupabaseSession();
 
-const contacts = [
-  { name: "Rina Putri", bank: "BCA ···· 2841", initials: "RP" },
-  { name: "Andi Pratama", bank: "BRI ···· 5510", initials: "AP" },
-  { name: "Sari Wulandari", bank: "Mandiri ···· 9027", initials: "SW" },
-];
+    if (!session.ok) {
+      // Public read-only fetch of approved Knowledge Base still works even before user login
+      const kb = await fetchApprovedKnowledgeBase().catch(() => null);
+      if (kb) {
+        setState((prev) => ({
+          ...prev,
+          recommendationRecords: [
+            ...kb,
+            ...prev.recommendationRecords.filter((r) => r.reviewStatus !== "approved"),
+          ],
+        }));
+      }
+      setCloudStatus({
+        state: session.reason === "auth_required" ? "auth_required" : "offline",
+        message: session.message,
+      });
+      return;
+    }
 
-const moneyFormatter = new Intl.NumberFormat("id-ID", {
-  style: "currency",
-  currency: "IDR",
-  minimumFractionDigits: 0,
-  maximumFractionDigits: 0,
-});
+    setCloudStatus({
+      state: "syncing",
+      userId: session.userId,
+      isAnonymous: session.isAnonymous,
+      ...(session.email ? { email: session.email } : {}),
+    });
 
-function formatMoney(value: number) {
-  return moneyFormatter.format(value);
-}
+    try {
+      const merged = await pullUserTransactions(session.userId, localSnapshot);
+      if (merged) {
+        setState(merged);
+      }
+      setCloudStatus({
+        state: "synced",
+        userId: session.userId,
+        isAnonymous: session.isAnonymous,
+        ...(session.email ? { email: session.email } : {}),
+        lastSyncAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      setCloudStatus({
+        state: "offline",
+        message: err instanceof Error ? err.message : "Failed to sync with Supabase.",
+      });
+    }
+  }, []);
 
-function Index() {
-  const [screen, setScreen] = useState<Screen>("home");
-  const [balance, setBalance] = useState(32_000_000);
-  const [balanceVisible, setBalanceVisible] = useState(true);
-  const [addStep, setAddStep] = useState<"source" | "amount" | "success">("source");
-  const [selectedSource, setSelectedSource] = useState("");
-  const [amount, setAmount] = useState("");
-  const [cardTransactionsAllowed, setCardTransactionsAllowed] = useState(true);
-  const [onlinePayments, setOnlinePayments] = useState(true);
-  const [selectedContact, setSelectedContact] = useState("");
-  const [transferNotice, setTransferNotice] = useState(false);
-  const [merchant, setMerchant] = useState("Pasar Raya Senja");
-  const [transactionFilter, setTransactionFilter] = useState<"Semua" | "Keluar" | "Masuk">(
-    "Semua",
+  // Hydrate persisted offline state, OS preferences, and Supabase cloud sync client-side
+  useEffect(() => {
+    const loaded = loadAppState();
+    setState(loaded);
+    if (!loaded.onboardingComplete) {
+      setScreen("onboarding");
+    }
+    void initializeCloudSync(loaded);
+
+    if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+      const motionMq = window.matchMedia("(prefers-reduced-motion: reduce)");
+      const darkMq = window.matchMedia("(prefers-color-scheme: dark)");
+      setOsReduceMotion(motionMq.matches);
+      setOsDarkTheme(darkMq.matches);
+      const onMotionChange = (ev: MediaQueryListEvent) => setOsReduceMotion(ev.matches);
+      const onDarkChange = (ev: MediaQueryListEvent) => setOsDarkTheme(ev.matches);
+      motionMq.addEventListener("change", onMotionChange);
+      darkMq.addEventListener("change", onDarkChange);
+      setHydrated(true);
+      return () => {
+        motionMq.removeEventListener("change", onMotionChange);
+        darkMq.removeEventListener("change", onDarkChange);
+      };
+    }
+    setHydrated(true);
+    return undefined;
+  }, [initializeCloudSync]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    saveAppState(state);
+  }, [state, hydrated]);
+
+  const effectiveDark =
+    state.profile.themeMode === "dark" || (state.profile.themeMode === "system" && osDarkTheme);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    root.classList.toggle("dark", effectiveDark);
+    root.setAttribute("data-type-scale", state.profile.dynamicTypeScale);
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (themeMeta) {
+      themeMeta.setAttribute("content", effectiveDark ? "#0f172a" : "#f8fafc");
+    }
+  }, [effectiveDark, state.profile.dynamicTypeScale]);
+
+  useEffect(() => {
+    if (import.meta.env.PROD && typeof window !== "undefined" && "serviceWorker" in navigator) {
+      void navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+  }, []);
+
+  const effectiveReduceMotion =
+    state.profile.reduceMotionOverride === null
+      ? osReduceMotion
+      : state.profile.reduceMotionOverride;
+
+  const calories = useMemo(
+    () => calculateCalorieGuidance(state.profile, state.goal),
+    [state.profile, state.goal],
   );
 
-  function openAddMoney() {
-    setAddStep("source");
-    setSelectedSource("");
-    setAmount("");
-    setScreen("add-money");
+  const lang = state.profile.language;
+  const copy = COPY[lang];
+
+  function runCloudTx(task: (userId: string) => Promise<void>) {
+    if (cloudStatus.state !== "synced") return;
+    const { userId, isAnonymous, email } = cloudStatus;
+    void task(userId)
+      .then(() => {
+        setCloudStatus({
+          state: "synced",
+          userId,
+          isAnonymous,
+          ...(email ? { email } : {}),
+          lastSyncAt: new Date().toISOString(),
+        });
+      })
+      .catch((err) => {
+        toast.error(
+          `Saved locally; Supabase sync error: ${err instanceof Error ? err.message : "unknown"}`,
+        );
+      });
   }
 
-  function finishAddMoney() {
-    const parsedAmount = Number(amount.replaceAll(".", ""));
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return;
-    setBalance((currentBalance) => currentBalance + parsedAmount);
-    setAddStep("success");
+  function rebuildPlanWith(nextState: AppState): AppState {
+    const regenerated = buildWeeklyPlan({
+      profile: nextState.profile,
+      goal: nextState.goal,
+      records: nextState.recommendationRecords,
+      recentRuns: nextState.runLogs,
+      weekStartISO: nextState.currentPlan.weekStartISO,
+      previousWeekRunMinutes: nextState.currentPlan.previousWeekRunMinutes,
+    });
+    return {
+      ...nextState,
+      currentPlan: regenerated,
+    };
   }
 
-  const visibleTransactions = transactions.filter((transaction) => {
-    if (transactionFilter === "Keluar") return transaction.kind === "expense";
-    if (transactionFilter === "Masuk") return transaction.kind === "income";
-    return true;
-  });
+  function handleOnboardingOrEditComplete(result: {
+    profile: AppState["profile"];
+    goal: AppState["goal"];
+    consent: AppState["consent"];
+  }) {
+    const updated = rebuildPlanWith({
+      ...state,
+      onboardingComplete: true,
+      profile: result.profile,
+      goal: result.goal,
+      consent: result.consent,
+    });
+    setState(updated);
+    runCloudTx(async (uid) => {
+      await syncProfileAndGoal(uid, updated);
+      await syncWeeklyPlan(uid, updated.currentPlan);
+    });
+    toast.success("Weekly plan & calorie range updated.");
+    setScreen("today");
+  }
+
+  function handleStartSession(session: PlannedSession) {
+    if (session.activityType === "gym_strength") {
+      setGymModalSession(session);
+      setGymModalOpen(true);
+    } else if (session.activityType !== "rest") {
+      setActiveRunSession(session);
+      setScreen("run");
+    }
+  }
+
+  function handleSnoozeSession(sessionId: string) {
+    const snoozedUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const updatedPlan = {
+      ...state.currentPlan,
+      sessions: state.currentPlan.sessions.map((s) =>
+        s.id === sessionId ? { ...s, snoozedUntil } : s,
+      ),
+    };
+    setState((prev) => ({ ...prev, currentPlan: updatedPlan }));
+    runCloudTx((uid) => syncWeeklyPlan(uid, updatedPlan));
+    toast.info("Reminder snoozed for 30 minutes.");
+  }
+
+  function handleUpdateSessionStatus(sessionId: string, status: PlannedSession["status"]) {
+    const updatedPlan = {
+      ...state.currentPlan,
+      sessions: state.currentPlan.sessions.map((s) => (s.id === sessionId ? { ...s, status } : s)),
+    };
+    setState((prev) => ({ ...prev, currentPlan: updatedPlan }));
+    runCloudTx((uid) => syncWeeklyPlan(uid, updatedPlan));
+    toast.success(`Session marked as ${status}.`);
+  }
+
+  function handleMoveSession(sessionId: string, targetDay: DayOfWeek) {
+    const result = moveSessionToDay(
+      state.currentPlan,
+      sessionId,
+      targetDay,
+      state.recommendationRecords,
+      state.profile,
+      state.goal,
+    );
+    if (!result.ok) {
+      toast.error(result.reason);
+      return { ok: false, reason: result.reason };
+    }
+    setState((prev) => ({ ...prev, currentPlan: result.plan }));
+    runCloudTx((uid) => syncWeeklyPlan(uid, result.plan));
+    toast.success("Session moved & safety rules re-verified.");
+    return { ok: true };
+  }
+
+  function handleSaveRun(run: RunLog) {
+    const updatedPlan = {
+      ...state.currentPlan,
+      sessions: state.currentPlan.sessions.map((s) =>
+        run.plannedSessionId && s.id === run.plannedSessionId
+          ? { ...s, status: "done" as const, completedLogId: run.id }
+          : s,
+      ),
+    };
+    setState((prev) => ({
+      ...prev,
+      runLogs: [run, ...prev.runLogs],
+      currentPlan: updatedPlan,
+    }));
+    setActiveRunSession(undefined);
+    runCloudTx(async (uid) => {
+      await syncRunLog(uid, run);
+      await syncWeeklyPlan(uid, updatedPlan);
+    });
+    toast.success("Run saved to history and Supabase.");
+  }
+
+  function handleSaveGymLog(log: GymLog) {
+    const updatedPlan = {
+      ...state.currentPlan,
+      sessions: state.currentPlan.sessions.map((s) =>
+        log.plannedSessionId && s.id === log.plannedSessionId
+          ? { ...s, status: "done" as const, completedLogId: log.id }
+          : s,
+      ),
+    };
+    setState((prev) => ({
+      ...prev,
+      gymLogs: [log, ...prev.gymLogs],
+      currentPlan: updatedPlan,
+    }));
+    runCloudTx(async (uid) => {
+      await syncGymLog(uid, log);
+      await syncWeeklyPlan(uid, updatedPlan);
+    });
+    toast.success("Gym workout logged & synced.");
+  }
+
+  function handleAddWeightEntry(weightKg: number) {
+    const todayISO = "2026-11-27";
+    const newEntry = { id: `w-${Date.now()}`, dateISO: todayISO, weightKg };
+    const updated = rebuildPlanWith({
+      ...state,
+      profile: {
+        ...state.profile,
+        weightKg,
+        updatedAt: new Date().toISOString(),
+      },
+      weightEntries: [...state.weightEntries.filter((e) => e.dateISO !== todayISO), newEntry],
+    });
+    setState(updated);
+    runCloudTx(async (uid) => {
+      await syncWeightEntry(uid, newEntry);
+      await syncProfileAndGoal(uid, updated);
+      await syncWeeklyPlan(uid, updated.currentPlan);
+    });
+    toast.success("Weight entry recorded & synced.");
+  }
+
+  function handleSubmitReport(recordId: string, reason: string) {
+    const report = {
+      id: `rep-${Date.now()}`,
+      recordId,
+      reason,
+      details: "Submitted from Why this? view",
+      createdAt: new Date().toISOString(),
+      status: "open" as const,
+    };
+    setState((prev) => ({
+      ...prev,
+      reports: [report, ...prev.reports],
+    }));
+    runCloudTx((uid) => syncReport(uid, report));
+    toast.success("Report submitted to Content Reviewer Console.");
+  }
+
+  function handleUpdateReviewerRecord(updated: RecommendationRecord) {
+    const nextState = rebuildPlanWith({
+      ...state,
+      recommendationRecords: state.recommendationRecords.map((r) =>
+        r.id === updated.id ? updated : r,
+      ),
+    });
+    setState(nextState);
+    runCloudTx((uid) => syncWeeklyPlan(uid, nextState.currentPlan));
+    toast.success(`Record updated (${updated.reviewStatus.replace("_", " ")}).`);
+  }
+
+  function handleRunWeeklyCheckIn(): string {
+    const nonRest = state.currentPlan.sessions.filter((s) => s.activityType !== "rest");
+    const doneCount = nonRest.filter((s) => s.status === "done").length;
+    const adherenceRate = nonRest.length > 0 ? doneCount / nonRest.length : 1;
+
+    const adaptation = evaluateWeeklyAdaptation({
+      adherenceRate,
+      weightEntries: state.weightEntries,
+      profile: state.profile,
+      goal: state.goal,
+      previousWeekRunMinutes: state.currentPlan.plannedRunMinutes,
+    });
+
+    const nextPlan = buildWeeklyPlan({
+      profile: state.profile,
+      goal: state.goal,
+      records: state.recommendationRecords,
+      recentRuns: state.runLogs,
+      weekStartISO: state.currentPlan.weekStartISO,
+      previousWeekRunMinutes: adaptation.recommendedRunVolumeMinutes,
+    });
+
+    setState((prev) => ({
+      ...prev,
+      currentPlan: nextPlan,
+      checkIns: [adaptation.checkIn, ...prev.checkIns],
+    }));
+
+    runCloudTx(async (uid) => {
+      await syncWeeklyCheckIn(uid, adaptation.checkIn);
+      await syncWeeklyPlan(uid, nextPlan);
+    });
+
+    toast.success("Weekly check-in applied.");
+    return adaptation.summary;
+  }
+
+  function handleDeleteAllData() {
+    if (cloudStatus.state === "synced") {
+      void deleteUserCloudData(cloudStatus.userId).catch(() => {});
+    }
+    clearAppState();
+    const fresh = createInitialAppState(false);
+    setState(fresh);
+    setScreen("onboarding");
+    toast.info("All personal data cleared.");
+  }
+
+  function updatePreferencesAndSync(updater: (prev: AppState) => AppState) {
+    setState((prev) => {
+      const next = updater(prev);
+      runCloudTx((uid) => syncProfileAndGoal(uid, next));
+      return next;
+    });
+  }
+
+  const navItems: { id: TabKey; label: string; icon: typeof Flame }[] = [
+    { id: "today", label: copy.navToday, icon: Flame },
+    { id: "plan", label: copy.navPlan, icon: CalendarDays },
+    { id: "run", label: copy.navRun, icon: Compass },
+    { id: "progress", label: copy.navProgress, icon: LineChart },
+    { id: "profile", label: copy.navProfile, icon: UserRound },
+  ];
+
+  const showBottomNav =
+    screen !== "onboarding" && screen !== "edit-profile" && screen !== "reviewer";
 
   return (
     <div className="app-stage">
-      <main className="app-frame">
-        {screen === "add-money" ? (
-          <AddMoneyScreen
-            amount={amount}
-            balance={balance}
-            onAmountChange={setAmount}
-            onBack={() => setScreen("home")}
-            onContinue={() => setAddStep("amount")}
-            onFinish={finishAddMoney}
-            onSelectSource={setSelectedSource}
-            selectedSource={selectedSource}
-            step={addStep}
+      <Toaster position="top-center" />
+      <main
+        className="app-frame"
+        data-reduce-motion={effectiveReduceMotion ? "true" : "false"}
+        data-type-scale={state.profile.dynamicTypeScale}
+      >
+        <StatusBar />
+
+        {screen === "onboarding" || screen === "edit-profile" ? (
+          <OnboardingWizard
+            initialProfile={state.profile}
+            initialGoal={state.goal}
+            initialConsent={state.consent}
+            isEditingExisting={screen === "edit-profile"}
+            onCancel={() => setScreen("today")}
+            onComplete={handleOnboardingOrEditComplete}
           />
         ) : (
-          <>
-            <section className="app-page" aria-live="polite">
-              {screen === "home" && (
-                <HomeScreen
-                  balance={balance}
-                  balanceVisible={balanceVisible}
-                  onAddMoney={openAddMoney}
-                  onBalanceToggle={() => setBalanceVisible((visible) => !visible)}
-                  onOpenTransactions={() => setScreen("transactions")}
-                />
-              )}
-              {screen === "transactions" && (
-                <TransactionsScreen
-                  filter={transactionFilter}
-                  onBack={() => setScreen("home")}
-                  onFilterChange={setTransactionFilter}
-                  rows={visibleTransactions}
-                />
-              )}
-              {screen === "map" && <MapScreen merchant={merchant} onSelect={setMerchant} />}
-              {screen === "transfer" && (
-                <TransferScreen
-                  contact={selectedContact}
-                  notice={transferNotice}
-                  onContinue={() => setTransferNotice(true)}
-                  onSelect={(name) => {
-                    setSelectedContact(name);
-                    setTransferNotice(false);
-                  }}
-                />
-              )}
-              {screen === "settings" && (
-                <SettingsScreen
-                  onlinePayments={onlinePayments}
-                  onOnlinePaymentsChange={setOnlinePayments}
-                  onCardTransactionsChange={setCardTransactionsAllowed}
-                  cardTransactionsAllowed={cardTransactionsAllowed}
-                />
-              )}
-              {screen === "profile" && <ProfileScreen />}
-            </section>
-            <BottomNavigation active={screen === "transactions" ? "home" : screen} onChange={setScreen} />
-          </>
+          <section className="app-page" aria-live="polite">
+            {screen === "today" && (
+              <TodayScreen
+                state={state}
+                calories={calories}
+                cloudStatus={cloudStatus}
+                reduceMotion={effectiveReduceMotion}
+                onStartSession={handleStartSession}
+                onSnoozeSession={handleSnoozeSession}
+                onSkipSession={(id) => handleUpdateSessionStatus(id, "skipped")}
+                onOpenPlan={() => setScreen("plan")}
+                onSubmitReport={handleSubmitReport}
+                onEditProfile={() => setScreen("edit-profile")}
+                onOpenCloudSync={() => setCloudModalOpen(true)}
+              />
+            )}
+
+            {screen === "plan" && (
+              <PlanScreen
+                state={state}
+                onMoveSession={handleMoveSession}
+                onStartSession={handleStartSession}
+                onMarkStatus={handleUpdateSessionStatus}
+                onRegeneratePlan={() => {
+                  const rebuilt = rebuildPlanWith(state);
+                  setState(rebuilt);
+                  runCloudTx((uid) => syncWeeklyPlan(uid, rebuilt.currentPlan));
+                  toast.success("Weekly plan rebuilt from reviewed KB.");
+                }}
+                onRunWeeklyCheckIn={handleRunWeeklyCheckIn}
+              />
+            )}
+
+            {screen === "run" && (
+              <RunTrackerScreen
+                state={state}
+                activePlannedSession={activeRunSession}
+                reduceMotion={effectiveReduceMotion}
+                onPermissionChange={(permission) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    consent: { ...prev.consent, locationPermission: permission },
+                  }))
+                }
+                onSaveRun={handleSaveRun}
+              />
+            )}
+
+            {screen === "progress" && (
+              <ProgressScreen state={state} onAddWeightEntry={handleAddWeightEntry} />
+            )}
+
+            {screen === "profile" && (
+              <ProfileSettingsScreen
+                state={state}
+                cloudStatus={cloudStatus}
+                onEditProfile={() => setScreen("edit-profile")}
+                onOpenCloudSync={() => setCloudModalOpen(true)}
+                onChangeUnits={(unitSystem) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    profile: { ...prev.profile, unitSystem },
+                  }))
+                }
+                onChangeLanguage={(language) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    profile: { ...prev.profile, language },
+                  }))
+                }
+                onChangeTheme={(themeMode) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    profile: { ...prev.profile, themeMode },
+                  }))
+                }
+                onToggleReduceMotion={(reduceMotionOverride) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    profile: { ...prev.profile, reduceMotionOverride },
+                  }))
+                }
+                onChangeDynamicType={(dynamicTypeScale) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    profile: { ...prev.profile, dynamicTypeScale },
+                  }))
+                }
+                onUpdateNotifications={(notificationSettings) =>
+                  updatePreferencesAndSync((prev) => ({ ...prev, notificationSettings }))
+                }
+                onToggleHealthKit={(healthKitSyncEnabled) =>
+                  updatePreferencesAndSync((prev) => ({
+                    ...prev,
+                    consent: { ...prev.consent, healthKitSyncEnabled },
+                  }))
+                }
+                onToggleV11Adaptation={(v11AdaptationEnabled) =>
+                  updatePreferencesAndSync((prev) => ({ ...prev, v11AdaptationEnabled }))
+                }
+                onOpenReviewerConsole={() => setScreen("reviewer")}
+                onExportSuccess={() => toast.success("Personal data bundle exported (JSON).")}
+                onDeleteAllData={handleDeleteAllData}
+              />
+            )}
+
+            {screen === "reviewer" && (
+              <ReviewerConsoleScreen
+                state={state}
+                onBack={() => setScreen("profile")}
+                onUpdateRecord={handleUpdateReviewerRecord}
+                onResolveReport={(reportId) => {
+                  const target = state.reports.find((r) => r.id === reportId);
+                  setState((prev) => ({
+                    ...prev,
+                    reports: prev.reports.map((r) =>
+                      r.id === reportId ? { ...r, status: "resolved" } : r,
+                    ),
+                  }));
+                  if (target) {
+                    runCloudTx((uid) => syncReport(uid, { ...target, status: "resolved" }));
+                  }
+                }}
+              />
+            )}
+          </section>
         )}
+
+        {showBottomNav && (
+          <nav className="bottom-navigation" aria-label="Main navigation">
+            {navItems.map((item) => {
+              const NavIcon = item.icon;
+              const isActive = screen === item.id;
+              return (
+                <Button
+                  key={item.id}
+                  type="button"
+                  variant="ghost"
+                  aria-current={isActive ? "page" : undefined}
+                  className={`nav-item${isActive ? " nav-item-active" : ""}`}
+                  onClick={() => setScreen(item.id)}
+                >
+                  <NavIcon />
+                  <span>{item.label}</span>
+                </Button>
+              );
+            })}
+          </nav>
+        )}
+
+        <GymLoggerModal
+          open={gymModalOpen}
+          state={state}
+          plannedSession={gymModalSession}
+          onClose={() => setGymModalOpen(false)}
+          onSaveLog={handleSaveGymLog}
+        />
+
+        <CloudSyncModal
+          open={cloudModalOpen}
+          status={cloudStatus}
+          onClose={() => setCloudModalOpen(false)}
+          onAuthSuccess={async () => {
+            await initializeCloudSync(state);
+          }}
+          onManualSync={async () => {
+            if (cloudStatus.state !== "synced") return;
+            await syncAllTransactions(cloudStatus.userId, state);
+            setCloudStatus({
+              ...cloudStatus,
+              lastSyncAt: new Date().toISOString(),
+            });
+            toast.success("All local transactions synced to Supabase.");
+          }}
+        />
       </main>
     </div>
   );
@@ -229,581 +681,13 @@ function Index() {
 
 function StatusBar() {
   return (
-    <div className="status-bar" aria-label="Status perangkat">
-      <span>9:41</span>
+    <div className="status-bar" aria-label="Device status">
+      <span className="tabular-nums">9:41</span>
       <div className="status-icons" aria-hidden="true">
         <Signal />
         <Wifi />
         <BatteryFull />
       </div>
     </div>
-  );
-}
-
-function IconButton({
-  label,
-  onClick,
-  children,
-}: {
-  label: string;
-  onClick?: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <Button
-      aria-label={label}
-      className="icon-button"
-      onClick={onClick}
-      size="icon"
-      title={label}
-      type="button"
-      variant="outline"
-    >
-      {children}
-    </Button>
-  );
-}
-
-function HomeScreen({
-  balance,
-  balanceVisible,
-  onAddMoney,
-  onBalanceToggle,
-  onOpenTransactions,
-}: {
-  balance: number;
-  balanceVisible: boolean;
-  onAddMoney: () => void;
-  onBalanceToggle: () => void;
-  onOpenTransactions: () => void;
-}) {
-  return (
-    <>
-      <StatusBar />
-      <header className="welcome-row">
-        <div>
-          <p className="eyebrow">Selamat pagi, Dimas</p>
-          <p className="supporting-copy">Senang melihatmu kembali</p>
-        </div>
-        <IconButton label="Buka notifikasi">
-          <Bell />
-        </IconButton>
-      </header>
-
-      <section className="balance-panel" aria-labelledby="balance-title">
-        <div className="balance-panel-heading">
-          <p id="balance-title" className="balance-label">
-            Total saldo
-          </p>
-          <IconButton label={balanceVisible ? "Sembunyikan saldo" : "Tampilkan saldo"} onClick={onBalanceToggle}>
-            {balanceVisible ? <EyeOff /> : <Eye />}
-          </IconButton>
-        </div>
-        <p className="balance-amount">{balanceVisible ? formatMoney(balance) : "••••••••"}</p>
-        <Button className="balance-action" onClick={onAddMoney} type="button">
-          <Plus /> Tambah saldo
-        </Button>
-      </section>
-
-      <section className="content-section" aria-labelledby="cards-heading">
-        <div className="section-heading">
-          <h2 id="cards-heading">Kartu saya</h2>
-          <span className="section-count">01</span>
-        </div>
-        <div className="bank-card" aria-label="Kartu debit berakhiran 4568">
-          <div className="bank-card-top">
-            <span className="bank-card-chip" aria-hidden="true" />
-            <span className="bank-card-brand">NEO</span>
-          </div>
-          <p className="bank-card-caption">Kartu debit</p>
-          <div className="bank-card-bottom">
-            <span>•••• 4568</span>
-            <span className="bank-card-cardholder">Dimas A.</span>
-          </div>
-        </div>
-      </section>
-
-      <section className="content-section transactions-preview" aria-labelledby="transactions-heading">
-        <div className="section-heading">
-          <h2 id="transactions-heading">Transaksi terbaru</h2>
-          <Button className="text-action" onClick={onOpenTransactions} type="button" variant="ghost">
-            Lihat semua <ChevronRight />
-          </Button>
-        </div>
-        <div className="transaction-list">
-          {transactions.slice(0, 3).map((transaction) => (
-            <TransactionRow key={transaction.merchant} transaction={transaction} />
-          ))}
-        </div>
-      </section>
-    </>
-  );
-}
-
-function AddMoneyScreen({
-  amount,
-  balance,
-  onAmountChange,
-  onBack,
-  onContinue,
-  onFinish,
-  onSelectSource,
-  selectedSource,
-  step,
-}: {
-  amount: string;
-  balance: number;
-  onAmountChange: (value: string) => void;
-  onBack: () => void;
-  onContinue: () => void;
-  onFinish: () => void;
-  onSelectSource: (source: string) => void;
-  selectedSource: string;
-  step: "source" | "amount" | "success";
-}) {
-  const sources = [
-    { name: "Transfer bank", description: "Dari rekening bank lain", icon: Landmark },
-    { name: "Kartu debit", description: "Debit atau kartu kredit", icon: CreditCard },
-    { name: "Virtual account", description: "Bayar melalui ATM atau mobile banking", icon: Smartphone },
-    { name: "Antar rekening", description: "Pindahkan dana dari rekening lain", icon: ArrowLeftRight },
-  ];
-
-  return (
-    <div className="add-money-page">
-      <StatusBar />
-      <header className="subpage-header">
-        <IconButton label="Kembali" onClick={onBack}>
-          <ArrowLeft />
-        </IconButton>
-        <h1>Tambah saldo</h1>
-        <span className="header-spacer" />
-      </header>
-
-      {step === "source" && (
-        <>
-          <p className="page-intro">Pilih cara untuk mengisi rekening Neobank kamu.</p>
-          <section className="source-section" aria-labelledby="source-title">
-            <h2 id="source-title">Pilih sumber dana</h2>
-            <div className="source-list">
-              {sources.map((source) => {
-                const SourceIcon = source.icon;
-                return (
-                  <Button
-                    aria-pressed={selectedSource === source.name}
-                    className={`source-option${selectedSource === source.name ? " source-option-selected" : ""}`}
-                    key={source.name}
-                    onClick={() => onSelectSource(source.name)}
-                    type="button"
-                    variant="outline"
-                  >
-                    <span className="source-icon"><SourceIcon /></span>
-                    <span className="source-copy">
-                      <span className="source-name">{source.name}</span>
-                      <span className="source-description">{source.description}</span>
-                    </span>
-                    <ChevronRight className="source-chevron" />
-                  </Button>
-                );
-              })}
-            </div>
-          </section>
-          <div className="bottom-action">
-            <Button className="full-action" disabled={!selectedSource} onClick={onContinue} type="button">
-              Lanjutkan <ChevronRight />
-            </Button>
-          </div>
-        </>
-      )}
-
-      {step === "amount" && (
-        <>
-          <p className="page-intro">Isi saldo melalui {selectedSource.toLowerCase()}.</p>
-          <section className="amount-panel">
-            <p className="balance-label">Saldo saat ini</p>
-            <p className="amount-current">{formatMoney(balance)}</p>
-            <label className="amount-label" htmlFor="top-up-amount">Nominal isi saldo</label>
-            <div className="amount-input-wrap">
-              <span>Rp</span>
-              <Input
-                autoComplete="off"
-                className="money-input"
-                id="top-up-amount"
-                inputMode="numeric"
-                onChange={(event) => onAmountChange(event.target.value.replace(/[^0-9]/g, ""))}
-                placeholder="0"
-                value={amount}
-              />
-            </div>
-            <div className="quick-amounts" aria-label="Pilihan nominal">
-              {[100000, 250000, 500000].map((value) => (
-                <Button
-                  className="amount-chip"
-                  key={value}
-                  onClick={() => onAmountChange(String(value))}
-                  type="button"
-                  variant="outline"
-                >
-                  {formatMoney(value).replace(",00", "")}
-                </Button>
-              ))}
-            </div>
-          </section>
-          <div className="bottom-action">
-            <Button className="full-action" disabled={!amount || Number(amount) <= 0} onClick={onFinish} type="button">
-              Tambahkan dana
-            </Button>
-          </div>
-        </>
-      )}
-
-      {step === "success" && (
-        <section className="success-state" aria-live="polite">
-          <span className="success-icon"><Check /></span>
-          <p className="eyebrow">Berhasil</p>
-          <h2>Saldo berhasil ditambahkan</h2>
-          <p className="supporting-copy">{formatMoney(Number(amount))} sudah tercatat pada saldo demo kamu.</p>
-          <p className="success-source">Sumber: {selectedSource}</p>
-          <Button className="full-action" onClick={onBack} type="button">Kembali ke beranda</Button>
-        </section>
-      )}
-    </div>
-  );
-}
-
-function TransactionsScreen({
-  filter,
-  onBack,
-  onFilterChange,
-  rows,
-}: {
-  filter: "Semua" | "Keluar" | "Masuk";
-  onBack: () => void;
-  onFilterChange: (filter: "Semua" | "Keluar" | "Masuk") => void;
-  rows: Transaction[];
-}) {
-  const filters = ["Semua", "Keluar", "Masuk"] as const;
-  return (
-    <>
-      <StatusBar />
-      <header className="page-header">
-        <IconButton label="Kembali ke beranda" onClick={onBack}><ArrowLeft /></IconButton>
-        <h1>Transaksi</h1>
-        <IconButton label="Cari transaksi"><Search /></IconButton>
-      </header>
-      <div className="filter-row" role="group" aria-label="Saring transaksi">
-        {filters.map((item) => (
-          <Button
-            aria-pressed={filter === item}
-            className={`filter-chip${filter === item ? " filter-chip-active" : ""}`}
-            key={item}
-            onClick={() => onFilterChange(item)}
-            type="button"
-            variant="outline"
-          >
-            {item}
-          </Button>
-        ))}
-        <Button aria-label="Pengaturan filter" className="filter-icon" type="button" variant="outline">
-          <SlidersHorizontal />
-        </Button>
-      </div>
-      <section className="transaction-day" aria-labelledby="today-total">
-        <div className="day-summary">
-          <div>
-            <p className="supporting-copy">Hari ini, Jumat</p>
-            <h2 id="today-total">Aktivitas terbaru</h2>
-          </div>
-          <p className="day-total">−Rp214.900</p>
-        </div>
-        <div className="transaction-list">
-          {rows.map((transaction) => <TransactionRow key={transaction.merchant} transaction={transaction} />)}
-        </div>
-      </section>
-      <section className="month-summary">
-        <div className="section-heading">
-          <h2>Ringkasan bulan ini</h2>
-          <Receipt />
-        </div>
-        <div className="summary-pair">
-          <span><ArrowUpRight /> Uang keluar</span>
-          <strong>Rp2.450.000</strong>
-        </div>
-        <div className="summary-pair">
-          <span><ArrowDownLeft /> Uang masuk</span>
-          <strong>Rp8.125.000</strong>
-        </div>
-      </section>
-    </>
-  );
-}
-
-function TransactionRow({ transaction }: { transaction: Transaction }) {
-  const TransactionIcon = transaction.icon;
-  const isIncome = transaction.kind === "income";
-  return (
-    <div className="transaction-row">
-      <span className="transaction-icon"><TransactionIcon /></span>
-      <span className="transaction-details">
-        <span className="transaction-name">{transaction.merchant}</span>
-        <span className="transaction-time">{transaction.detail}</span>
-      </span>
-      <span className="transaction-values">
-        <span className="transaction-amount">{isIncome ? "+" : "−"}{formatMoney(transaction.amount)}</span>
-        {isIncome && <span className="cashback-tag">Masuk</span>}
-      </span>
-    </div>
-  );
-}
-
-function MapScreen({ merchant, onSelect }: { merchant: string; onSelect: (name: string) => void }) {
-  const locations = [
-    { name: "Pasar Raya Senja", icon: ShoppingBag, className: "map-pin map-pin-one" },
-    { name: "Kopi Tepi Jalan", icon: Coffee, className: "map-pin map-pin-two" },
-    { name: "Toko Sehat", icon: Gift, className: "map-pin map-pin-three" },
-  ];
-  return (
-    <>
-      <StatusBar />
-      <header className="screen-title-row">
-        <div>
-          <p className="eyebrow">Jelajahi sekitar</p>
-          <h1>Tempat favoritmu</h1>
-        </div>
-        <IconButton label="Cari tempat"><Search /></IconButton>
-      </header>
-      <div className="map-filter-row">
-        <Button className="map-filter" type="button" variant="outline"><SlidersHorizontal /> Filter</Button>
-        <Button className="map-filter map-filter-active" type="button" variant="outline"><Gift /> Cashback</Button>
-      </div>
-      <section className="map-canvas" aria-label="Peta toko di sekitar Anda">
-        <span className="map-street-label map-street-label-one">Jl. Melati</span>
-        <span className="map-street-label map-street-label-two">Jl. Cendana</span>
-        <span className="map-street-label map-street-label-three">Jl. Merdeka</span>
-        <span className="map-you"><span />Kamu di sini</span>
-        {locations.map((location) => {
-          const LocationIcon = location.icon;
-          return (
-            <Button
-              aria-label={`Pilih ${location.name}`}
-              className={`${location.className}${merchant === location.name ? " map-pin-selected" : ""}`}
-              key={location.name}
-              onClick={() => onSelect(location.name)}
-              size="icon"
-              title={location.name}
-              type="button"
-              variant="outline"
-            >
-              <LocationIcon />
-            </Button>
-          );
-        })}
-      </section>
-      <section className="merchant-panel" aria-live="polite">
-        <div className="merchant-heading">
-          <span className="merchant-icon"><MapPin /></span>
-          <span className="merchant-name-wrap">
-            <span className="merchant-name">{merchant}</span>
-            <span className="merchant-address">Jl. Melati No. 18 · 1,2 km</span>
-          </span>
-          <span className="cashback-pill"><Gift /> 5%</span>
-        </div>
-        <div className="merchant-footer">
-          <span className="open-status"><span /> Buka sampai 21.00</span>
-          <Button className="text-action" type="button" variant="ghost">Detail <ChevronRight /></Button>
-        </div>
-      </section>
-      <section className="nearby-section">
-        <div className="section-heading"><h2>Di sekitar kamu</h2><span className="section-count">03</span></div>
-        <p className="supporting-copy">Pilih pin di peta untuk melihat penawaran.</p>
-      </section>
-    </>
-  );
-}
-
-function TransferScreen({
-  contact,
-  notice,
-  onContinue,
-  onSelect,
-}: {
-  contact: string;
-  notice: boolean;
-  onContinue: () => void;
-  onSelect: (name: string) => void;
-}) {
-  return (
-    <>
-      <StatusBar />
-      <header className="screen-title-row">
-        <div>
-          <p className="eyebrow">Kirim dengan mudah</p>
-          <h1>Transfer uang</h1>
-        </div>
-        <IconButton label="Bantuan transfer"><CircleHelp /></IconButton>
-      </header>
-      <section className="transfer-balance">
-        <span className="transfer-balance-icon"><Wallet /></span>
-        <span><span className="supporting-copy">Sumber dana</span><strong>Saldo utama</strong></span>
-        <span className="transfer-balance-amount">Rp32 jt</span>
-      </section>
-      <div className="section-heading transfer-list-heading">
-        <h2>Kirim ke</h2>
-        <Button className="text-action" type="button" variant="ghost"><Plus /> Kontak baru</Button>
-      </div>
-      <div className="contact-list">
-        {contacts.map((person) => (
-          <Button
-            aria-pressed={contact === person.name}
-            className={`contact-row${contact === person.name ? " contact-row-selected" : ""}`}
-            key={person.name}
-            onClick={() => onSelect(person.name)}
-            type="button"
-            variant="ghost"
-          >
-            <span className="contact-avatar">{person.initials}</span>
-            <span className="contact-copy"><strong>{person.name}</strong><span>{person.bank}</span></span>
-            {contact === person.name ? <Check className="contact-check" /> : <ChevronRight className="contact-chevron" />}
-          </Button>
-        ))}
-      </div>
-      {contact && (
-        <section className="transfer-selected" aria-live="polite">
-          <p className="supporting-copy">Penerima dipilih</p>
-          <h2>{contact}</h2>
-          {notice ? (
-            <p className="transfer-notice"><Check /> Detail transfer siap ditinjau.</p>
-          ) : (
-            <Button className="full-action" onClick={onContinue} type="button">Lanjutkan <ChevronRight /></Button>
-          )}
-        </section>
-      )}
-      <section className="transfer-shortcuts">
-        <div className="section-heading"><h2>Cara lain</h2></div>
-        <div className="shortcut-row">
-          <span><Landmark /> Ke rekening bank</span><ChevronRight />
-        </div>
-        <div className="shortcut-row">
-          <span><Smartphone /> Ke nomor ponsel</span><ChevronRight />
-        </div>
-      </section>
-    </>
-  );
-}
-
-function SettingsScreen({
-  onlinePayments,
-  onOnlinePaymentsChange,
-  onCardTransactionsChange,
-  cardTransactionsAllowed,
-}: {
-  onlinePayments: boolean;
-  onOnlinePaymentsChange: (enabled: boolean) => void;
-  onCardTransactionsChange: (enabled: boolean) => void;
-  cardTransactionsAllowed: boolean;
-}) {
-  const [expandedSetting, setExpandedSetting] = useState("");
-  return (
-    <>
-      <StatusBar />
-      <header className="screen-title-row settings-heading">
-        <div><p className="eyebrow">Keamanan & kontrol</p><h1>Pengaturan</h1></div>
-      </header>
-      <section className="settings-section" aria-labelledby="card-settings-title">
-        <h2 id="card-settings-title">Kontrol kartu</h2>
-        <div className="settings-list">
-          <div className="setting-row">
-            <span className="setting-icon"><CreditCard /></span>
-            <span className="setting-copy"><strong>Transaksi kartu</strong><span>Izinkan pembayaran dengan kartu</span></span>
-            <Switch aria-label="Izinkan transaksi kartu" checked={cardTransactionsAllowed} onCheckedChange={onCardTransactionsChange} />
-          </div>
-          <div className="setting-row">
-            <span className="setting-icon"><ShieldCheck /></span>
-            <span className="setting-copy"><strong>Pembayaran online</strong><span>Belanja aman di internet</span></span>
-            <Switch aria-label="Izinkan pembayaran online" checked={onlinePayments} onCheckedChange={onOnlinePaymentsChange} />
-          </div>
-          <Button className="setting-link" onClick={() => setExpandedSetting(expandedSetting === "pin" ? "" : "pin")} type="button" variant="ghost">
-            <span className="setting-icon"><LockKeyhole /></span>
-            <span className="setting-copy"><strong>Lihat PIN kartu</strong><span>Periksa PIN dengan aman</span></span>
-            <ChevronRight />
-          </Button>
-          {expandedSetting === "pin" && <p className="setting-detail">PIN hanya dapat dilihat setelah verifikasi keamanan.</p>}
-          <Button className="setting-link" onClick={() => setExpandedSetting(expandedSetting === "card" ? "" : "card")} type="button" variant="ghost">
-            <span className="setting-icon"><CreditCard /></span>
-            <span className="setting-copy"><strong>Ganti kartu</strong><span>Kartu hilang, rusak, atau kedaluwarsa</span></span>
-            <ChevronRight />
-          </Button>
-          {expandedSetting === "card" && <p className="setting-detail">Penggantian kartu tersedia melalui layanan nasabah.</p>}
-        </div>
-      </section>
-      <section className="settings-section" aria-labelledby="preferences-title">
-        <h2 id="preferences-title">Preferensi</h2>
-        <div className="settings-list">
-          <div className="shortcut-row"><span><Bell /> Notifikasi</span><ChevronRight /></div>
-          <div className="shortcut-row"><span><CircleHelp /> Pusat bantuan</span><ChevronRight /></div>
-        </div>
-      </section>
-      <p className="settings-version">Neobank · Versi 1.0</p>
-    </>
-  );
-}
-
-function ProfileScreen() {
-  return (
-    <>
-      <StatusBar />
-      <header className="profile-title"><h1>Profil</h1></header>
-      <section className="profile-identity">
-        <span className="profile-avatar">D</span>
-        <h2>Dimas Ardiansyah</h2>
-        <p className="supporting-copy">Nasabah sejak 2024</p>
-      </section>
-      <section className="profile-section" aria-labelledby="personal-info-title">
-        <div className="section-heading"><h2 id="personal-info-title">Informasi pribadi</h2><Button className="text-action" type="button" variant="ghost">Edit</Button></div>
-        <div className="profile-info-list">
-          <ProfileInfo icon={UserRound} label="Nama" value="Dimas Ardiansyah" />
-          <ProfileInfo icon={Mail} label="Email" value="dimas@example.com" />
-          <ProfileInfo icon={Phone} label="Nomor ponsel" value="+62 812 0000 0000" />
-          <ProfileInfo icon={MapPin} label="Alamat" value="Jakarta, Indonesia" />
-        </div>
-      </section>
-      <section className="profile-section profile-account">
-        <div className="section-heading"><h2>Informasi akun</h2></div>
-        <div className="shortcut-row"><span><ShieldCheck /> Verifikasi identitas</span><ChevronRight /></div>
-        <div className="shortcut-row"><span><Landmark /> Rekening & bank</span><ChevronRight /></div>
-      </section>
-    </>
-  );
-}
-
-function ProfileInfo({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
-  return (
-    <div className="profile-info-row">
-      <Icon />
-      <span><span>{label}</span><strong>{value}</strong></span>
-    </div>
-  );
-}
-
-function BottomNavigation({ active, onChange }: { active: TabKey; onChange: (screen: Screen) => void }) {
-  return (
-    <nav className="bottom-navigation" aria-label="Navigasi utama">
-      {navigation.map((item) => {
-        const NavIcon = item.icon;
-        const isActive = item.id === active;
-        return (
-          <Button
-            aria-current={isActive ? "page" : undefined}
-            className={`nav-item${isActive ? " nav-item-active" : ""}`}
-            key={item.id}
-            onClick={() => onChange(item.id)}
-            type="button"
-            variant="ghost"
-          >
-            <NavIcon />
-            <span>{item.label}</span>
-          </Button>
-        );
-      })}
-    </nav>
   );
 }
